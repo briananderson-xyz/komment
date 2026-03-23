@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Komment</string>
+    <string name="overlay_notification_channel">Overlay Service</string>
+    <string name="overlay_notification_title">Komment is active</string>
+    <string name="overlay_notification_text">Tap to open, or use the floating bubble</string>
+    <string name="action_stop">Stop</string>
+</resources>

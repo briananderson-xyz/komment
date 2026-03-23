@@ -1,0 +1,354 @@
+package com.kontourai.komment.overlay
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.os.IBinder
+import android.view.Gravity
+import android.view.WindowManager
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.platform.ComposeView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.savedstate.SavedStateRegistry
+import androidx.savedstate.SavedStateRegistryController
+import androidx.savedstate.SavedStateRegistryOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import com.kontourai.komment.KommentApp
+import com.kontourai.komment.MainActivity
+import com.kontourai.komment.data.Annotation
+import com.kontourai.komment.data.Session
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
+
+    private val lifecycleRegistry = LifecycleRegistry(this)
+    override val lifecycle: Lifecycle get() = lifecycleRegistry
+
+    private val savedStateRegistryController = SavedStateRegistryController.create(this)
+    override val savedStateRegistry: SavedStateRegistry
+        get() = savedStateRegistryController.savedStateRegistry
+
+    private lateinit var windowManager: WindowManager
+    private var overlayView: ComposeView? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    private val _currentSessionId = MutableStateFlow<Long?>(null)
+    val currentSessionId = _currentSessionId.asStateFlow()
+
+    private val _isExpanded = MutableStateFlow(false)
+    private val _isVisible = MutableStateFlow(true)
+    private val _annotations = MutableStateFlow<List<Annotation>>(emptyList())
+
+    companion object {
+        const val CHANNEL_ID = "overlay_channel"
+        const val NOTIFICATION_ID = 1
+        const val ACTION_STOP = "com.kontourai.komment.STOP"
+        const val ACTION_ADD_TEXT = "com.kontourai.komment.ADD_TEXT"
+        const val EXTRA_TEXT = "extra_text"
+
+        var instance: OverlayService? = null
+            private set
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+        savedStateRegistryController.performRestore(null)
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, createNotification())
+        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        initSession()
+        showOverlay()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_ADD_TEXT -> {
+                val text = intent.getStringExtra(EXTRA_TEXT)
+                if (!text.isNullOrBlank()) {
+                    addTextAnnotation(text)
+                }
+            }
+        }
+        return START_STICKY
+    }
+
+    private fun initSession() {
+        val app = application as KommentApp
+        serviceScope.launch {
+            val existing = app.sessionRepository.getActiveSession()
+            val sessionId = if (existing != null) {
+                existing.id
+            } else {
+                val dateStr = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
+                app.sessionRepository.insert(Session(name = "Review - $dateStr"))
+            }
+            _currentSessionId.value = sessionId
+            // Observe annotations
+            app.annotationRepository.getBySession(sessionId).collect {
+                _annotations.value = it
+            }
+        }
+    }
+
+    private fun showOverlay() {
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 200
+        }
+
+        val composeView = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(this@OverlayService)
+            setViewTreeSavedStateRegistryOwner(this@OverlayService)
+            setContent {
+                val isExpanded = _isExpanded.asStateFlow()
+                val isVisible = _isVisible.asStateFlow()
+                val annotations = _annotations.asStateFlow()
+
+                OverlayUI(
+                    isExpanded = isExpanded,
+                    isVisible = isVisible,
+                    annotations = annotations,
+                    onToggleExpand = { _isExpanded.value = !_isExpanded.value },
+                    onCollapse = { _isExpanded.value = false },
+                    onClose = { stopSelf() },
+                    onScreenshot = { requestScreenshot() },
+                    onAddText = { showTextInput() },
+                    onCopyAll = { copyAllAnnotations() },
+                    onViewAll = { /* handled in OverlayUI */ },
+                    onDrag = { dx, dy ->
+                        params.x += dx.toInt()
+                        params.y += dy.toInt()
+                        windowManager.updateViewLayout(overlayView, params)
+                    },
+                    onDragEnd = {
+                        // Snap to nearest edge
+                        val display = windowManager.defaultDisplay
+                        val screenWidth = display.width
+                        params.x = if (params.x < screenWidth / 2) 0 else screenWidth
+                        windowManager.updateViewLayout(overlayView, params)
+                    },
+                    onSaveAnnotation = { text, comment ->
+                        saveAnnotation(selectedText = text, comment = comment)
+                    },
+                    onDeleteAnnotation = { annotation -> deleteAnnotation(annotation) },
+                    onUpdateComment = { annotation, newComment -> updateComment(annotation, newComment) }
+                )
+            }
+        }
+
+        overlayView = composeView
+        windowManager.addView(composeView, params)
+    }
+
+    fun setOverlayVisible(visible: Boolean) {
+        _isVisible.value = visible
+    }
+
+    fun setNeedsFocus(needsFocus: Boolean) {
+        val view = overlayView ?: return
+        val params = view.layoutParams as WindowManager.LayoutParams
+        if (needsFocus) {
+            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        } else {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+        windowManager.updateViewLayout(view, params)
+    }
+
+    private fun requestScreenshot() {
+        _isVisible.value = false
+        val intent = Intent(this, com.kontourai.komment.MediaProjectionRequestActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+    }
+
+    private fun showTextInput() {
+        _isExpanded.value = true
+    }
+
+    fun addTextAnnotation(text: String) {
+        val sessionId = _currentSessionId.value ?: return
+        val app = application as KommentApp
+        serviceScope.launch {
+            app.annotationRepository.insert(
+                Annotation(
+                    sessionId = sessionId,
+                    selectedText = text,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun saveAnnotation(
+        screenshotPath: String? = null,
+        selectedText: String? = null,
+        comment: String = "",
+        sourceApp: String? = null
+    ) {
+        val sessionId = _currentSessionId.value ?: return
+        val app = application as KommentApp
+        serviceScope.launch {
+            app.annotationRepository.insert(
+                Annotation(
+                    sessionId = sessionId,
+                    screenshotPath = screenshotPath,
+                    selectedText = selectedText,
+                    comment = comment,
+                    sourceApp = sourceApp,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    private fun deleteAnnotation(annotation: Annotation) {
+        val app = application as KommentApp
+        serviceScope.launch {
+            // Clean up screenshot file if exists
+            annotation.screenshotPath?.let { path ->
+                java.io.File(path).delete()
+            }
+            app.annotationRepository.delete(annotation)
+        }
+    }
+
+    private fun updateComment(annotation: Annotation, newComment: String) {
+        val app = application as KommentApp
+        serviceScope.launch {
+            app.annotationRepository.update(annotation.copy(comment = newComment))
+        }
+    }
+
+    private fun copyAllAnnotations() {
+        val app = application as KommentApp
+        serviceScope.launch {
+            val sessionId = _currentSessionId.value ?: return@launch
+            val annotations = app.annotationRepository.getBySessionList(sessionId)
+            if (annotations.isEmpty()) {
+                android.widget.Toast.makeText(this@OverlayService, "No annotations to copy", android.widget.Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val compiled = compileAnnotations(annotations)
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Komment Review", compiled))
+            android.widget.Toast.makeText(this@OverlayService, "Copied ${annotations.size} annotations", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun compileAnnotations(annotations: List<Annotation>): String {
+        val sb = StringBuilder()
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
+        annotations.forEachIndexed { index, ann ->
+            sb.appendLine("## ${index + 1}.")
+            sb.appendLine("*${dateFormat.format(Date(ann.timestamp))}*")
+            ann.sourceApp?.let { sb.appendLine("Source: $it") }
+            sb.appendLine()
+
+            ann.selectedText?.let {
+                sb.appendLine("> $it")
+                sb.appendLine()
+            }
+
+            if (ann.comment.isNotBlank()) {
+                sb.appendLine(ann.comment)
+                sb.appendLine()
+            }
+
+            ann.screenshotPath?.let {
+                sb.appendLine("[Screenshot attached]")
+                sb.appendLine()
+            }
+
+            sb.appendLine("---")
+            sb.appendLine()
+        }
+        return sb.toString().trimEnd()
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(com.kontourai.komment.R.string.overlay_notification_channel),
+            NotificationManager.IMPORTANCE_LOW
+        )
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+    }
+
+    private fun createNotification(): Notification {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        val stopIntent = PendingIntent.getService(
+            this, 0,
+            Intent(this, OverlayService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(com.kontourai.komment.R.string.overlay_notification_title))
+            .setContentText(getString(com.kontourai.komment.R.string.overlay_notification_text))
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(openIntent)
+            .addAction(
+                Notification.Action.Builder(
+                    null,
+                    getString(com.kontourai.komment.R.string.action_stop),
+                    stopIntent
+                ).build()
+            )
+            .setOngoing(true)
+            .build()
+    }
+
+    override fun onDestroy() {
+        instance = null
+        overlayView?.let {
+            windowManager.removeView(it)
+            overlayView = null
+        }
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+}
