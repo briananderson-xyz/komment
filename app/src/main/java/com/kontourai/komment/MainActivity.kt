@@ -100,7 +100,7 @@ class MainActivity : ComponentActivity() {
                     onCopySession = { session ->
                         CoroutineScope(Dispatchers.IO).launch {
                             val annotations = app.annotationRepository.getBySessionList(session.id)
-                            val compiled = compileAnnotations(annotations)
+                            val compiled = com.kontourai.komment.export.AnnotationCompiler.compileToMarkdown(annotations)
                             runOnUiThread {
                                 val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
                                 clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Komment Review", compiled))
@@ -117,7 +117,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 return@launch
                             }
-                            val compiled = compileAnnotations(annotations)
+                            val compiled = com.kontourai.komment.export.AnnotationCompiler.compileToMarkdown(annotations)
                             val screenshotFiles = annotations.mapNotNull { it.screenshotPath?.let { p -> File(p) } }.filter { it.exists() }
 
                             runOnUiThread {
@@ -166,32 +166,6 @@ class MainActivity : ComponentActivity() {
         Toast.makeText(this, "Komment overlay started", Toast.LENGTH_SHORT).show()
     }
 
-    private fun compileAnnotations(annotations: List<Annotation>): String {
-        val sb = StringBuilder()
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-
-        annotations.forEachIndexed { index, ann ->
-            sb.appendLine("## ${index + 1}.")
-            sb.appendLine("*${dateFormat.format(Date(ann.timestamp))}*")
-            ann.sourceApp?.let { sb.appendLine("Source: $it") }
-            sb.appendLine()
-            ann.selectedText?.let {
-                sb.appendLine("> $it")
-                sb.appendLine()
-            }
-            if (ann.comment.isNotBlank()) {
-                sb.appendLine(ann.comment)
-                sb.appendLine()
-            }
-            ann.screenshotPath?.let {
-                sb.appendLine("[Screenshot attached]")
-                sb.appendLine()
-            }
-            sb.appendLine("---")
-            sb.appendLine()
-        }
-        return sb.toString().trimEnd()
-    }
 }
 
 @Composable

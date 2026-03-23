@@ -265,42 +265,11 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 android.widget.Toast.makeText(this@OverlayService, "No annotations to copy", android.widget.Toast.LENGTH_SHORT).show()
                 return@launch
             }
-            val compiled = compileAnnotations(annotations)
+            val compiled = com.kontourai.komment.export.AnnotationCompiler.compileToMarkdown(annotations)
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Komment Review", compiled))
             android.widget.Toast.makeText(this@OverlayService, "Copied ${annotations.size} annotations", android.widget.Toast.LENGTH_SHORT).show()
         }
-    }
-
-    private fun compileAnnotations(annotations: List<Annotation>): String {
-        val sb = StringBuilder()
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-
-        annotations.forEachIndexed { index, ann ->
-            sb.appendLine("## ${index + 1}.")
-            sb.appendLine("*${dateFormat.format(Date(ann.timestamp))}*")
-            ann.sourceApp?.let { sb.appendLine("Source: $it") }
-            sb.appendLine()
-
-            ann.selectedText?.let {
-                sb.appendLine("> $it")
-                sb.appendLine()
-            }
-
-            if (ann.comment.isNotBlank()) {
-                sb.appendLine(ann.comment)
-                sb.appendLine()
-            }
-
-            ann.screenshotPath?.let {
-                sb.appendLine("[Screenshot attached]")
-                sb.appendLine()
-            }
-
-            sb.appendLine("---")
-            sb.appendLine()
-        }
-        return sb.toString().trimEnd()
     }
 
     private fun createNotificationChannel() {
