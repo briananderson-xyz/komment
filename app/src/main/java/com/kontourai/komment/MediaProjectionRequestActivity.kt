@@ -1,7 +1,5 @@
 package com.kontourai.komment
 
-import android.app.Activity
-import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
@@ -20,7 +18,7 @@ import com.kontourai.komment.overlay.OverlayService
 import java.io.File
 import java.io.FileOutputStream
 
-class MediaProjectionRequestActivity : Activity() {
+class MediaProjectionRequestActivity : androidx.activity.ComponentActivity() {
 
     companion object {
         private var cachedResultCode: Int? = null
