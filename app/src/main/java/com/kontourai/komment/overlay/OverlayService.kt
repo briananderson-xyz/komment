@@ -5,9 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.pm.ServiceInfo
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -16,11 +16,10 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
+import android.view.WindowMetrics
 import android.widget.Toast
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -41,6 +40,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -123,14 +124,21 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 app.sessionRepository.insert(Session(name = "Review - $dateStr"))
             }
             _currentSessionId.value = sessionId
-            // Observe annotations
             app.annotationRepository.getBySession(sessionId).collect {
                 _annotations.value = it
             }
         }
     }
 
+    private fun getScreenSize(): Pair<Int, Int> {
+        val metrics: WindowMetrics = windowManager.currentWindowMetrics
+        val bounds = metrics.bounds
+        return Pair(bounds.width(), bounds.height())
+    }
+
     private fun showOverlay() {
+        val (screenWidth, _) = getScreenSize()
+
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -160,20 +168,22 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                     onCollapse = { _isExpanded.value = false },
                     onClose = { stopSelf() },
                     onScreenshot = { requestScreenshot() },
-                    onAddText = { showTextInput() },
+                    onAddText = { /* UI handles showing text input */ },
                     onCopyAll = { copyAllAnnotations() },
                     onViewAll = { /* handled in OverlayUI */ },
                     onDrag = { dx, dy ->
                         params.x += dx.toInt()
                         params.y += dy.toInt()
-                        windowManager.updateViewLayout(overlayView, params)
+                        try {
+                            windowManager.updateViewLayout(overlayView, params)
+                        } catch (_: Exception) {}
                     },
                     onDragEnd = {
-                        // Snap to nearest edge
-                        val display = windowManager.defaultDisplay
-                        val screenWidth = display.width
-                        params.x = if (params.x < screenWidth / 2) 0 else screenWidth
-                        windowManager.updateViewLayout(overlayView, params)
+                        val (sw, _) = getScreenSize()
+                        params.x = if (params.x < sw / 2) 0 else sw
+                        try {
+                            windowManager.updateViewLayout(overlayView, params)
+                        } catch (_: Exception) {}
                     },
                     onSaveAnnotation = { text, comment ->
                         saveAnnotation(selectedText = text, comment = comment)
@@ -194,13 +204,15 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
     fun setNeedsFocus(needsFocus: Boolean) {
         val view = overlayView ?: return
-        val params = view.layoutParams as WindowManager.LayoutParams
-        if (needsFocus) {
-            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-        } else {
-            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        }
-        windowManager.updateViewLayout(view, params)
+        try {
+            val params = view.layoutParams as WindowManager.LayoutParams
+            if (needsFocus) {
+                params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            } else {
+                params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            }
+            windowManager.updateViewLayout(view, params)
+        } catch (_: Exception) {}
     }
 
     private fun requestScreenshot() {
@@ -212,23 +224,34 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     }
 
     fun performScreenCapture(resultCode: Int, data: Intent) {
-        // Must upgrade to MEDIA_PROJECTION type BEFORE calling getMediaProjection on Android 14+
-        startForeground(
-            NOTIFICATION_ID,
-            createNotification(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        )
+        try {
+            // Upgrade to MEDIA_PROJECTION type BEFORE getMediaProjection (required Android 14+)
+            startForeground(
+                NOTIFICATION_ID,
+                createNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Cannot start media projection: ${e.message}", Toast.LENGTH_SHORT).show()
+            setOverlayVisible(true)
+            return
+        }
 
         val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection = projectionManager.getMediaProjection(resultCode, data)
+        val projection = try {
+            projectionManager.getMediaProjection(resultCode, data)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Projection failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            downgradeServiceType()
+            setOverlayVisible(true)
+            return
+        }
 
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getMetrics(metrics)
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
+        val (width, height) = getScreenSize()
+        val density = resources.displayMetrics.densityDpi
 
         val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
 
@@ -273,26 +296,31 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 e.printStackTrace()
                 Toast.makeText(this, "Screenshot failed: ${e.message}", Toast.LENGTH_SHORT).show()
             } finally {
-                virtualDisplay.release()
-                projection.stop()
-                imageReader.close()
-                // Downgrade back to specialUse only
-                startForeground(
-                    NOTIFICATION_ID,
-                    createNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                )
+                try { virtualDisplay.release() } catch (_: Exception) {}
+                try { projection.stop() } catch (_: Exception) {}
+                try { imageReader.close() } catch (_: Exception) {}
+                downgradeServiceType()
                 setOverlayVisible(true)
             }
-        }, 300)
+        }, 400)
     }
 
-    private fun saveScreenshotFile(bitmap: Bitmap): java.io.File? {
+    private fun downgradeServiceType() {
+        try {
+            startForeground(
+                NOTIFICATION_ID,
+                createNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } catch (_: Exception) {}
+    }
+
+    private fun saveScreenshotFile(bitmap: Bitmap): File? {
         return try {
-            val dir = java.io.File(applicationContext.filesDir, "screenshots")
+            val dir = File(applicationContext.filesDir, "screenshots")
             dir.mkdirs()
-            val file = java.io.File(dir, "screenshot_${System.currentTimeMillis()}.jpg")
-            java.io.FileOutputStream(file).use { out ->
+            val file = File(dir, "screenshot_${System.currentTimeMillis()}.jpg")
+            FileOutputStream(file).use { out ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
             }
             file
@@ -300,10 +328,6 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             e.printStackTrace()
             null
         }
-    }
-
-    private fun showTextInput() {
-        _isExpanded.value = true
     }
 
     fun addTextAnnotation(text: String) {
@@ -345,9 +369,8 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private fun deleteAnnotation(annotation: Annotation) {
         val app = application as KommentApp
         serviceScope.launch {
-            // Clean up screenshot file if exists
             annotation.screenshotPath?.let { path ->
-                java.io.File(path).delete()
+                File(path).delete()
             }
             app.annotationRepository.delete(annotation)
         }
@@ -366,13 +389,13 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             val sessionId = _currentSessionId.value ?: return@launch
             val annotations = app.annotationRepository.getBySessionList(sessionId)
             if (annotations.isEmpty()) {
-                android.widget.Toast.makeText(this@OverlayService, "No annotations to copy", android.widget.Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@OverlayService, "No annotations to copy", Toast.LENGTH_SHORT).show()
                 return@launch
             }
             val compiled = com.kontourai.komment.export.AnnotationCompiler.compileToMarkdown(annotations)
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Komment Review", compiled))
-            android.widget.Toast.makeText(this@OverlayService, "Copied ${annotations.size} annotations", android.widget.Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@OverlayService, "Copied ${annotations.size} annotations", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -416,10 +439,12 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
     override fun onDestroy() {
         instance = null
-        overlayView?.let {
-            windowManager.removeView(it)
-            overlayView = null
-        }
+        try {
+            overlayView?.let {
+                windowManager.removeView(it)
+                overlayView = null
+            }
+        } catch (_: Exception) {}
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         serviceScope.cancel()
         super.onDestroy()
