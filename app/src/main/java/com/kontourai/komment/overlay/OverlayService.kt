@@ -212,6 +212,14 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     }
 
     fun performScreenCapture(resultCode: Int, data: Intent) {
+        // Must upgrade to MEDIA_PROJECTION type BEFORE calling getMediaProjection on Android 14+
+        startForeground(
+            NOTIFICATION_ID,
+            createNotification(),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        )
+
         val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = projectionManager.getMediaProjection(resultCode, data)
 
@@ -268,6 +276,12 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 virtualDisplay.release()
                 projection.stop()
                 imageReader.close()
+                // Downgrade back to specialUse only
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
                 setOverlayVisible(true)
             }
         }, 300)
