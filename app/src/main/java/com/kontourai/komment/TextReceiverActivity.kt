@@ -3,6 +3,7 @@ package com.kontourai.komment
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Toast
 import com.kontourai.komment.overlay.OverlayService
 
@@ -41,7 +42,11 @@ class TextReceiverActivity : Activity() {
             service.addTextAnnotation(text)
             Toast.makeText(this, "Text added to review", Toast.LENGTH_SHORT).show()
         } else {
-            // Start the overlay service first, then add the text
+            // Check overlay permission before trying to start service
+            if (!Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "Open Komment first to grant overlay permission", Toast.LENGTH_LONG).show()
+                return
+            }
             val serviceIntent = Intent(this, OverlayService::class.java).apply {
                 action = OverlayService.ACTION_ADD_TEXT
                 putExtra(OverlayService.EXTRA_TEXT, text)
