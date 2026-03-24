@@ -8,10 +8,18 @@ import android.app.Service
 import android.content.pm.ServiceInfo
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.media.ImageReader
+import android.media.projection.MediaProjectionManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.Lifecycle
@@ -201,6 +209,83 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         startActivity(intent)
+    }
+
+    fun performScreenCapture(resultCode: Int, data: Intent) {
+        val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val projection = projectionManager.getMediaProjection(resultCode, data)
+
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getMetrics(metrics)
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+
+        val virtualDisplay = projection.createVirtualDisplay(
+            "KommentCapture",
+            width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader.surface, null, null
+        )
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                val image = imageReader.acquireLatestImage()
+                if (image != null) {
+                    val planes = image.planes
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * width
+
+                    val bitmap = Bitmap.createBitmap(
+                        width + rowPadding / pixelStride, height,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    bitmap.copyPixelsFromBuffer(buffer)
+                    image.close()
+
+                    val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height)
+                    if (croppedBitmap !== bitmap) bitmap.recycle()
+
+                    val file = saveScreenshotFile(croppedBitmap)
+                    croppedBitmap.recycle()
+
+                    if (file != null) {
+                        saveAnnotation(screenshotPath = file.absolutePath)
+                        Toast.makeText(this, "Screenshot saved", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    Toast.makeText(this, "Failed to capture screenshot", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                Toast.makeText(this, "Screenshot failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            } finally {
+                virtualDisplay.release()
+                projection.stop()
+                imageReader.close()
+                setOverlayVisible(true)
+            }
+        }, 300)
+    }
+
+    private fun saveScreenshotFile(bitmap: Bitmap): java.io.File? {
+        return try {
+            val dir = java.io.File(applicationContext.filesDir, "screenshots")
+            dir.mkdirs()
+            val file = java.io.File(dir, "screenshot_${System.currentTimeMillis()}.jpg")
+            java.io.FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+            }
+            file
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
 
     private fun showTextInput() {
